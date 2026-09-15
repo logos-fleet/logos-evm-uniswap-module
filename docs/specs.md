@@ -21,9 +21,9 @@ holds no keys**. Instead it:
 2. ABI-encodes the on-chain reads (V2 `getReserves`, V3 `slot0`, V4
    `StateView.getSlot0`/`getLiquidity`, plus quote calls) and packs them into a
    **single Multicall3 `aggregate3` batch**.
-3. Issues that one batch as an `eth_call` **through `eth_rpc_module`** — the only
-   way it touches the network — so the wallet's fail-closed SOCKS5 proxy still
-   governs every request.
+3. Issues that one batch as an `eth_call` **through `eth_rpc_module`**, with the
+   generated **async** client — the only way it touches the network — so the
+   wallet's fail-closed SOCKS5 proxy still governs every request.
 4. Decodes the returned bytes, applies the V2/V3/V4 price math, picks the
    **deepest pool** as the token's ETH price, anchors token→USD on a configured
    stablecoin, and (for swaps) ABI-encodes the winning router calldata.
@@ -38,7 +38,7 @@ logos-evm-wallet-backend-module    (coordinator; calls get_prices / quote_swap /
         │                           build_swap for its Market tab + send pipeline)
         ▼
 logos-evm-uniswap-module  ◀── THIS REPO  (price oracle + swap router)
-        │  module→module: modules().eth_rpc_module.call(chainId, callJson)
+        │  module→module: modules().eth_rpc_module.call_async(chainId, callJson, …)
         ▼
 logos-evm-eth-rpc-module           (multi-chain JSON-RPC transport, fail-closed)
         ▼
@@ -68,30 +68,32 @@ with `cargo test --no-default-features`) and a **glue layer** (behind the defaul
 ```mermaid
 flowchart TB
     subgraph consumer["Caller (wallet_backend_module / logoscore -c)"]
-        C["configure / get_chains / get_prices / quote_swap / build_swap"]
+        C["configure / get_chains / get_prices / quote_swap / build_swap\nstart_get_prices / start_quote_swap / start_build_swap / take_result"]
     end
 
     subgraph module["uniswap_module (Rust cdylib, concurrency: multi)"]
         direction TB
 
         subgraph glue["glue.rs — Logos transport + orchestration"]
-            TR["UniswapModule trait (the LIDL/codegen contract)\nconfigure · get_chains · get_prices · quote_swap · build_swap"]
+            TR["UniswapModule trait (the LIDL/codegen contract)\nconfigure · get_chains · get_prices · quote_swap · build_swap\nstart_get_prices · start_quote_swap · start_build_swap · take_result"]
             IMPL["UniswapModuleImpl\ncfg: RwLock&lt;Option&lt;ConfigStore&gt;&gt;"]
-            RM["run_multicall()\nencode aggregate3 → eth_rpc.call → decode"]
+            RM["dispatch_multicall()\nencode aggregate3 → eth_rpc.call_async → decode in the callback"]
             INST["logos_module_install() → install::&lt;UniswapModuleImpl&gt;()\ngenerated provider_gen.rs (modules(), install(), RustModuleContext)"]
         end
 
         subgraph cores["pure cores (offline, no network, no keys)"]
+            JB["jobs.rs\nJobBoard: the answer parked while the call is in flight\nPending / Ready(once) / Unknown · bounded at 64"]
             CFG["config.rs\nChainUniswap · ConfigStore\ndefault_chains() (1/10/42161/8453)\npersisted config.json"]
             PRI["pricing.rs\nCREATE2 derivation · sqrtPriceX96/reserve math\nMulticall3 encode/decode · pick_best · token_usd_prices"]
             SWP["swap.rs\nV2 getAmountsOut / V3 QuoterV2 quote\nbest-route select · router calldata + approve"]
         end
     end
 
-    EXT["modules().eth_rpc_module.call(chainId, callJson)\n(the ONLY outbound surface)"]
+    EXT["modules().eth_rpc_module.call_async(chainId, callJson, deadlineMs, cb)\n(the ONLY outbound surface, and it is async)"]
 
     C --> TR --> IMPL
     IMPL --> CFG
+    IMPL --> JB
     IMPL --> RM
     RM --> PRI
     IMPL --> PRI
@@ -105,22 +107,37 @@ flowchart TB
 
 | Concern | Where | Notes |
 |---|---|---|
-| Public API contract | `glue.rs` `pub trait UniswapModule` | 5 methods + `on_context_ready` lifecycle hook |
+| Public API contract | `glue.rs` `pub trait UniswapModule` | 9 methods + `on_context_ready` lifecycle hook |
 | Transport / codegen | `generated/provider_gen.rs` (built, gitignored) | provides `modules()`, `install::<T>()`, `RustModuleContext`; `include!`d into `glue.rs` |
 | Module state | `UniswapModuleImpl.cfg: RwLock<Option<ConfigStore>>` | `None` until `on_context_ready`; read under shared lock, written only by `configure` |
 | Config + persistence | `config.rs` | seeded defaults overlaid with persisted overrides at `<instance>/config.json` |
 | Price math (pure) | `pricing.rs` | CREATE2, Multicall3, V2/V3/V4 math, best-rate |
 | Swap building (pure) | `swap.rs` | V2/V3 quote + router calldata; V4 swaps are a fast-follow |
-| Outbound calls | only `run_multicall` → `eth_rpc_module.call` | no other network surface exists |
+| Deferred answers (pure) | `jobs.rs` | `JobBoard` for the `start_*` spelling: bounded at 64, `Ready` handed over once |
+| Outbound calls | only `dispatch_multicall` → `eth_rpc_module.call_async` | no other network surface exists, and the one there is is **async** |
 
 ---
 
 ## 3. Communication with dependencies
 
 Every price/quote/swap method ultimately performs **exactly one** Multicall3
-`eth_call` through `eth_rpc_module`. The sequence below is the real
-`get_prices` path (the same shape applies to `quote_swap`/`build_swap`, which
-batch quote calls instead of pool reads).
+`eth_call` through `eth_rpc_module`, and it is issued with the generated **async**
+client. The sequence below is the real `get_prices` path (the same shape applies
+to `quote_swap`/`build_swap`, which batch quote calls instead of pool reads).
+
+**Why async, and why there is only ever one call per method.** The synchronous
+twin is not a spelling a `web` (wasm) image can have: a Worker is a single event
+loop with no ASYNCIFY (ADR 0004), so a call that blocked for its reply would
+deadlock the loop that delivers it, and logos-rust-sdk does not compile
+`lp_invoke` there. And because replies are **not ordered**, anything that chained
+two outbound calls would have to sequence them in the callbacks — no method here
+does, so the question never arises: `build_swap` looks like two steps (quote,
+then build) but only the quote leaves the process.
+
+Each method is split in three — `plan_*` (read config, derive addresses, build
+the batch; no network), `dispatch_multicall` (the one `call_async`), `finish_*`
+(decode the reply into the answer; pure, and it runs in the callback, so it
+carries its plan rather than re-reading module state).
 
 ```mermaid
 sequenceDiagram
@@ -132,16 +149,16 @@ sequenceDiagram
     participant Node as JSON-RPC node<br/>(via net-proxy)
 
     Caller->>Uni: get_prices(chainId, {tokens:[{address,decimals}]})
-    Uni->>Uni: chain_cfg(chainId) under RwLock read → clone, drop lock
+    Uni->>Uni: plan_prices: chain_cfg(chainId) under RwLock read → clone, drop lock
     Uni->>Pri: build_pricing_batch(chain, weth, tokens + stablecoins)
     Pri-->>Uni: PricingBatch { calls:[(target,callData)], candidates }
     Note over Uni,Pri: derives V2 pair / V3 pool / V4 poolId via CREATE2 (offline)
     Uni->>Pri: multicall3_aggregate3_calldata(calls)
     Pri-->>Uni: aggregate3 calldata (one blob, allowFailure=true)
-    Uni->>Eth: eth_rpc_module.call(chainId,<br/>{ to: multicall3, data: "0x..." })
+    Uni->>Eth: eth_rpc_module.call_async(chainId,<br/>{ to: multicall3, data: "0x..." }, deadlineMs, cb)
     Eth->>Node: eth_call (single round-trip, fail-closed via proxy)
     Node-->>Eth: 0x… (aggregate3 Result3[])
-    Eth-->>Uni: { ok:true, result:"0x…" }
+    Eth-->>Uni: cb({ ok:true, result:"0x…" })<br/>(on the consumer's owner thread, not the caller's)
     Uni->>Pri: decode_aggregate3_returns + decode_prices + token_usd_prices
     Pri-->>Uni: per-token ETH price (deepest pool) + USD (stablecoin anchor)
     Uni-->>Caller: { ok:true, chainId, prices:[{address,eth,usd}, …] }
@@ -152,20 +169,28 @@ sequenceDiagram
 The glue reaches its dependency through the generated typed client:
 
 ```rust
-// glue.rs :: run_multicall
+// glue.rs :: dispatch_multicall — THE MODULE'S ONE OUTBOUND CALL SITE
 let call_json = json!({ "to": multicall3, "data": format!("0x{}", hex::encode(data)) }).to_string();
-let resp = modules().eth_rpc_module.call(chain_id, &call_json).map_err(|e| e.to_string())?;
-let v: Value = serde_json::from_str(&resp)?;
+modules().eth_rpc_module.call_async(chain_id, &call_json, None, move |reply| {
+    done(reply.map_err(|e| e.to_string()).and_then(|resp| decode_multicall_reply(&resp)))
+});
+
+// glue.rs :: decode_multicall_reply — pure, shared by both spellings
+let v: Value = serde_json::from_str(resp)?;
 if v.get("ok").and_then(Value::as_bool) == Some(false) {
     return Err(v.get("error").and_then(Value::as_str).unwrap_or("eth_call failed").to_string());
 }
 let result_hex = v.get("result").and_then(Value::as_str).ok_or("multicall: no result")?;
 ```
 
+`done` runs on the protocol's completion path — the consumer's **owner** thread,
+which `lp_client_create` anchors on the Qt main thread — not on the thread that
+issued the call.
+
 | Item | Value |
 |---|---|
 | Dependency module | `eth_rpc_module` (`logos-co/logos-evm-eth-rpc-module`) |
-| Method called | `call(chain_id: i64, call_json: String) -> String` |
+| Method called | `call_async(chain_id: i64, call_json: &str, deadline_ms: Option<i64>, cb)` (the generated async twin of `call`) |
 | `call_json` shape | `{ "to": <multicall3 addr>, "data": "0x<aggregate3 calldata>" }` (an `eth_call`) |
 | Success return | `{ "ok": true, "result": "0x<Result3[] bytes>" }` |
 | Error return | `{ "ok": false, "error": "<message>" }` (e.g. `RPC_FAILED`, proxy refusal) |
@@ -199,6 +224,15 @@ address.
 | [`get_prices`](#43-get_prices) | `get_prices(chain_id: i64, tokens_json: String) -> String` | `{ ok, chainId, prices:[…] }` |
 | [`quote_swap`](#44-quote_swap) | `quote_swap(chain_id: i64, params_json: String) -> String` | `{ ok, version, fee, amountOut }` |
 | [`build_swap`](#45-build_swap) | `build_swap(chain_id: i64, params_json: String) -> String` | `{ ok, version, fee, router, value, data, amountOut, amountOutMin, approve }` |
+| [`start_get_prices`](#46-the-start_-methods--take_result) | `start_get_prices(chain_id: i64, tokens_json: String) -> String` | `{ ok, jobId }` |
+| [`start_quote_swap`](#46-the-start_-methods--take_result) | `start_quote_swap(chain_id: i64, params_json: String) -> String` | `{ ok, jobId }` |
+| [`start_build_swap`](#46-the-start_-methods--take_result) | `start_build_swap(chain_id: i64, params_json: String) -> String` | `{ ok, jobId }` |
+| [`take_result`](#46-the-start_-methods--take_result) | `take_result(job_id: String) -> String` | the corresponding answer, or `{ ok:false, pending:true, jobId }` |
+
+The three `start_*` methods are the **async twins** of `get_prices` /
+`quote_swap` / `build_swap`: same inputs, same answers, collected later. Which
+spelling a caller must use is a property of the TARGET, not of the caller — see
+[4.6](#46-the-start_-methods--take_result).
 
 Plus the lifecycle hook `on_context_ready(&self, ctx: &RustModuleContext)` (not a
 callable RPC) — invoked once by the runtime to load persisted config from
@@ -394,6 +428,58 @@ logoscore call uniswap_module build_swap 1 @swap_params.json
 
 ---
 
+### 4.6 The `start_*` methods + `take_result`
+
+```rust
+fn start_get_prices(&self, chain_id: i64, tokens_json: String) -> String
+fn start_quote_swap(&self, chain_id: i64, params_json: String) -> String
+fn start_build_swap(&self, chain_id: i64, params_json: String) -> String
+fn take_result(&self, job_id: String) -> String
+```
+
+Each `start_*` takes exactly the arguments of the method it twins, fires the same
+single Multicall3 `eth_call`, and answers **at once** with a job id:
+
+```json
+{ "ok": true, "jobId": "j7" }
+```
+
+`take_result(jobId)` then returns, in order:
+
+| State | Answer |
+|---|---|
+| the `eth_call` is in flight | `{ "ok": false, "pending": true, "jobId": "j7" }` |
+| it landed | exactly what the waiting twin would have returned (`{ok:true,…}` **or** `{ok:false,error:…}`) |
+| collected, never started, or evicted | `{ "ok": false, "error": "unknown job 'j7': …" }` |
+
+**The answer is handed over ONCE.** Collecting frees the slot, so a poller that
+keeps asking after it has the answer gets `unknown job`, not the same payload for
+ever. The board is bounded at 64 (`jobs::CAPACITY`) and evicts the OLDEST slot,
+so a caller that starts jobs and never collects them cannot grow the module —
+and the evicted id reads `unknown job` rather than `pending` for ever, which is a
+difference a caller can act on.
+
+**Failures that happen before anything is sent** — unparseable JSON, an
+unconfigured chain, a bad WETH address, a missing `recipient` — are reported by
+`start_*` itself as the usual `{ ok:false, error }`, with **no** job started.
+
+**Why both spellings exist.** The waiting twins wait on a channel, which is safe
+on a native host and only there: `concurrency: "multi"` puts every dispatch on
+its own worker thread while the reply is delivered on the consumer's owner
+thread, so the thread that waits is never the thread that must deliver
+(*measured:* five concurrent `get_prices` against a node that takes 1.5 s
+complete in 1.56 s total, not 7.5 s). On a `web` (wasm) image there is one
+thread and both would be it, so the waiting twins dispatch nothing and report
+that in their error; `start_*` + `take_result` is the shape that works
+everywhere.
+
+```bash
+logoscore call uniswap_module start_get_prices 31337 @tokens.json   # {"jobId":"j1","ok":true}
+logoscore call uniswap_module take_result j1                        # pending, then the prices
+```
+
+---
+
 ## 5. Configuration & data model
 
 ### 5.1 `ChainUniswap`
@@ -560,8 +646,11 @@ cargo test --no-default-features        # config + pricing + swap, no Logos/Qt
 Covered: CREATE2 against known mainnet pools, V2/V3 price recovery, V2 reserve
 depth, `pick_best` preference rules, USD anchoring, batch enumeration counts
 (mainnet = 1 V2 + 8 V3 + 6 V4 = 15 sub-calls; WETH self-pool skipped), quote
-selection, and swap-calldata selectors (`getAmountsOut` `0xd06ca61f`, `approve`
-`0x095ea7b3`, `exactInputSingle` `0x414bf389`).
+selection, swap-calldata selectors (`getAmountsOut` `0xd06ca61f`, `approve`
+`0x095ea7b3`, `exactInputSingle` `0x414bf389`), and the `jobs::JobBoard` state
+machine behind `start_*` / `take_result` — `Pending` → `Ready` once → `Unknown`,
+the 64-slot bound, and that a reply landing after its slot was evicted is dropped
+rather than resurrected.
 
 ### 7.3 Drive it via `logoscore`
 
@@ -578,6 +667,10 @@ nix build 'github:logos-co/logos-logoscore-cli#cli' --out-link ./logos
 ./logos/bin/logoscore call uniswap_module configure @uni_chain.json
 ./logos/bin/logoscore call eth_rpc_module set_chain_config 31337 @rpc_chain.json
 ./logos/bin/logoscore call uniswap_module get_prices 31337 @tokens.json
+
+# ...or the async spelling, which is the one a `web` image must use:
+./logos/bin/logoscore call uniswap_module start_get_prices 31337 @tokens.json
+./logos/bin/logoscore call uniswap_module take_result j1
 ```
 
 ### 7.4 The executable doc-test
@@ -609,19 +702,32 @@ two-column HTML report to GitHub Pages.
 ## 8. Concurrency (`concurrency: "multi"`)
 
 `metadata.json` declares `concurrency: "multi"`. Every price/quote/swap method
-**blocks on a Multicall3 `eth_call` through `eth_rpc`**, so the module opts into
+depends on a Multicall3 `eth_call` through `eth_rpc`, so the module opts into
 **concurrent handler dispatch**: pricing several chains (or several callers) at
 once no longer serializes behind one in-flight RPC. The runtime returns each
 result via a pending-sentinel that the consumer transport resolves transparently.
+
+**`multi` is what makes the WAITING spelling possible at all**, and that is worth
+stating as a dependency rather than a nicety. `get_prices` / `quote_swap` /
+`build_swap` wait on a channel for a reply that arrives in an async callback. The
+Qt glue runs each dispatch on its own worker QThread, while `lp_client_create`
+anchors the consumer on the Qt **main** thread and `invokeRemoteMethodAsync`
+marshals the completion onto that owner thread — so the thread that waits is
+never the thread that must deliver. Under `concurrency: "single"` both would be
+the main thread and every one of these calls would hang for its full budget.
+*Measured:* five concurrent `get_prices` against a node that takes 1.5 s complete
+in **1.56 s total**, and one alone takes 1.554 s.
 
 The multi contract makes the generated trait take `&self` and require
 `Send + Sync`. Concurrency safety is upheld by:
 
 - **`cfg: RwLock<Option<ConfigStore>>`** — readers (`get_prices`, `quote_swap`,
   `build_swap`, `get_chains`) take the **shared read lock**, clone the chain they
-  need, and **drop the guard before** the blocking `eth_rpc` call (`with_cfg` /
-  `chain_cfg`). `run_multicall` touches no module state, so **no lock is held
-  across the network call**.
+  need, and **drop the guard before** the `eth_rpc` call (`with_cfg` /
+  `chain_cfg`, via the `plan_*` helpers). `dispatch_multicall` touches no module
+  state, so **no lock is held across the network call** — nor could one be: the
+  reply is decoded in a callback that runs on another thread, which is why each
+  `plan_*` hands its `finish_*` everything it needs by value.
 - **`configure` is the only writer** — it takes the exclusive write lock
   (`with_cfg_mut`), the sole mutator of the config map.
 
@@ -634,10 +740,10 @@ This is the same pattern as the wallet's other `concurrency:multi` module
 
 | Invariant | Enforced by |
 |---|---|
-| **No direct network access.** The module never opens a socket. | All on-chain reads go through `modules().eth_rpc_module.call`; the crate pulls in no HTTP client (`alloy` is `default-features = false`, `sol-types` only). |
+| **No direct network access.** The module never opens a socket. | All on-chain reads go through `modules().eth_rpc_module.call_async`; the crate pulls in no HTTP client (`alloy` is `default-features = false`, `sol-types` only). |
 | **Fail-closed privacy preserved.** | Because the only egress is `eth_rpc_module`, the wallet's `net-proxy` SOCKS5 chokepoint still governs every request — this module can't bypass it. |
 | **No keys / no signing.** | The module builds **unsigned** calldata only (`build_swap` returns `(router, value, data, approve)`); signing/broadcast is the backend + `keystore_module`. |
-| **One batch, one decoder.** | `run_multicall` encodes a single `aggregate3` and decodes via `decode_aggregate3_returns` — never hand-split the hex (see §3 warning). |
+| **One batch, one decoder.** | `dispatch_multicall` encodes a single `aggregate3` and decodes via `decode_aggregate3_returns` — never hand-split the hex (see §3 warning). |
 | **`allowFailure = true` per sub-call.** | A non-existent pool reverting one read won't sink the whole batch (`Call3.allowFailure = true`); reverted reads decode to `None` and are simply skipped. |
 | **Offline address derivation is checksum-agnostic but exact.** | CREATE2 derivation is verified against known mainnet pools in unit tests; a wrong factory/init-hash in config just yields empty pools (priced as `null`), never a wrong-but-plausible address from an untrusted source. |
 | **Config-not-ready is a hard error, not a silent default.** | Reads error with `"uniswap not initialized (context not ready)"`; `configure` returns `false` until `on_context_ready` has run. |
@@ -652,9 +758,10 @@ This is the same pattern as the wallet's other `concurrency:multi` module
 | `flake.nix` | Nix build via `mkLogosModule`; declares the `eth_rpc_module` input with a `follows` on `logos-module-builder` |
 | `CMakeLists.txt` | `logos_module(NAME uniswap_module)` |
 | `rust-lib/Cargo.toml` | Crate (`alloy` sol-types only, `hex`, `serde`; optional `logos-rust-sdk` behind `logos_module`) |
-| `rust-lib/src/lib.rs` | Crate root; exposes `config`/`pricing`/`swap`, gates `glue` behind `logos_module` |
-| `rust-lib/src/glue.rs` | **Public API** (`pub trait UniswapModule`), `UniswapModuleImpl`, `run_multicall`, the `modules().eth_rpc_module.call` site |
+| `rust-lib/src/lib.rs` | Crate root; exposes `config`/`jobs`/`pricing`/`swap`, gates `glue` behind `logos_module` |
+| `rust-lib/src/glue.rs` | **Public API** (`pub trait UniswapModule`), `UniswapModuleImpl`, the `plan_*`/`finish_*` split, and `dispatch_multicall` — the one `modules().eth_rpc_module.call_async` site |
 | `rust-lib/src/config.rs` | `ChainUniswap`, `ConfigStore`, `default_chains()`, persistence |
+| `rust-lib/src/jobs.rs` | `JobBoard`: the deferred answers behind `start_*` / `take_result`. Pure, no Logos dependency |
 | `rust-lib/src/pricing.rs` | CREATE2, Multicall3 encode/decode, V2/V3/V4 price math, `pick_best`, `token_usd_prices` |
 | `rust-lib/src/swap.rs` | V2/V3 quote calldata + decode, `decode_best_quote`, router `build_swap` + approvals |
 | `doctests/uniswap-module-runtime.test.yaml` | Executable end-to-end doc-test (mock-node `get_prices` round-trip) |

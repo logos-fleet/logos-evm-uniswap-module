@@ -79,43 +79,36 @@
       # module has no `platforms` overlay, so the two agree everywhere.
       inherit (module) config configFor;
 
-      # ── WHY THERE IS NO `web` (wasm) OUTPUT, AND WHAT WOULD GIVE IT ONE ───
+      # ── THE `web` (wasm) VARIANT: THIS MODULE IS READY, THE PLATFORM IS NOT ─
       #
-      # logos-module-builder publishes `packages.<system>.web` for every
-      # `codegen.rust` module whose protocol pin carries a wasm subset, and this
-      # module's crate DOES compile to wasm32-unknown-emscripten -- measured, the
-      # archive builds and holds wasm objects. The image will not LINK:
+      # THE MODULE SIDE IS DONE (#167 Part A). Every outbound call site here is
+      # the generated ASYNC client -- `modules().eth_rpc_module.call_async(...)`,
+      # issued from `dispatch_multicall` in rust-lib/src/glue.rs, which is the
+      # module's ONE outbound call site. The synchronous twin is not a spelling a
+      # wasm image can have: a Worker is a single event loop with no ASYNCIFY
+      # (ADR 0004), so a call that blocked for its reply would deadlock the loop
+      # that delivers it. That rewrite is what the `start_get_prices` /
+      # `start_quote_swap` / `start_build_swap` + `take_result` methods are --
+      # the shape an async call has from the outside, on every target.
       #
-      #   wasm-ld: error: lib uniswap_module.a(logos_rust_sdk…rcgu.o):
-      #            undefined symbol: lp_client_create
-      #            undefined symbol: lp_client_destroy
-      #            undefined symbol: lp_invoke
+      # WHAT IS STILL MISSING IS NOT IN THIS REPO. logos-protocol's wasm subset
+      # (cpp/implementations/wasm/wasm_lp_abi.cpp) implements the token/inbound
+      # half of the C ABI and not the outbound one, so an image linking this
+      # crate still fails at `wasm-ld` naming `lp_client_create` /
+      # `lp_client_destroy` / `lp_invoke_async`. Until that lands (#166), the
+      # builder's dependency gate (#165) publishes no `web` output for a module
+      # with dependencies at all, so there is nothing here to build and no
+      # `checks.web-variant` to publish.
       #
-      # Those three are the OUTBOUND consumer stack, and a wasm image has none:
-      # logos-protocol's wasm subset (cpp/implementations/wasm/wasm_lp_abi.cpp)
-      # deliberately implements the token half of the C ABI and not this half,
-      # and says so -- "a wasm module that tried to lp_client_create() would fail
-      # to LINK, naming the symbol, which is the honest answer for an image with
-      # no transport it could dial". logos_wasm_host.cpp states the same rule
-      # from the other side: "it makes no outbound calls -- a wasm module with
-      # dependencies is a later slice".
+      # WHEN #166 LANDS, this block goes and `checks.<system>.web-variant`
+      # arrives with it: a node harness driving `start_get_prices` +
+      # `take_result` against a stub `eth_rpc_module` answering the Multicall3
+      # `eth_call`, modelled on logos-evm-keystore-module/nix/web-variant-test.nix.
       #
-      # It is not a gap in this module, and nothing here can close it. Every one
-      # of this module's price and swap methods is ONE eth_call issued through
-      # `modules().eth_rpc_module`, synchronously, and that synchronous shape is
-      # what the target forbids: a Worker is a single event loop with no ASYNCIFY
-      # (ADR 0004), so a call that blocked for a reply would deadlock the loop
-      # that delivers it. The door that exists -- logos_web_module_call.h, used
-      # by a `ui_qml` backend image -- is async-only for exactly that reason.
-      #
-      # WHAT THE PHONE DOES INSTEAD, and why the mobile Bare build above is the
-      # whole of what the wallet needed: uniswap runs as a NATIVE Bundled Bare
-      # module in the app image, and the wallet UI's `web` variant calls it by
-      # name over that async door -- the same path it already takes to
-      # eth_rpc_module. No wasm uniswap is involved in a working Market tab.
-      #
-      # So this flake publishes no `checks.web-variant`. A check that built the
-      # `web` output would be red on every pin until the outbound door lands, and
-      # one that asserted the link error would go red the day it does.
+      # WHAT THE PHONE DOES MEANWHILE, unchanged: uniswap runs as a NATIVE
+      # Bundled Bare module in the app image (the mobile keys above), and the
+      # wallet UI's `web` variant calls it BY NAME over the view door -- the same
+      # path it already takes to eth_rpc_module. No wasm uniswap is involved in a
+      # working Market tab.
     };
 }
