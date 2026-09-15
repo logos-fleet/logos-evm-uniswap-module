@@ -79,36 +79,59 @@
       # module has no `platforms` overlay, so the two agree everywhere.
       inherit (module) config configFor;
 
-      # ── THE `web` (wasm) VARIANT: THIS MODULE IS READY, THE PLATFORM IS NOT ─
+      # ── THE `web` (wasm) VARIANT, AND THE CHECK THAT DRIVES IT ─────────────
       #
-      # THE MODULE SIDE IS DONE (#167 Part A). Every outbound call site here is
-      # the generated ASYNC client -- `modules().eth_rpc_module.call_async(...)`,
-      # issued from `dispatch_multicall` in rust-lib/src/glue.rs, which is the
-      # module's ONE outbound call site. The synchronous twin is not a spelling a
-      # wasm image can have: a Worker is a single event loop with no ASYNCIFY
+      # `packages.<system>.web` is an emscripten image with the module's crate,
+      # logos-protocol's wasm subset and a Wasm host linked into it — the form
+      # this module takes in a webview, where there is no dlopen and no host to
+      # dlopen into (ADR 0003). It exists for a module with DEPENDENCIES only
+      # because logos-protocol's wasm subset now implements the outbound half of
+      # the C ABI (`lp_client_create` / `lp_invoke_async`), which is what
+      # logos-module-builder's gate reads off the pin (`hasOutboundDoor`,
+      # ADR 0009 gate 2).
+      #
+      # The one outbound call site here is the generated ASYNC client —
+      # `modules().eth_rpc_module.call_async(...)` from `dispatch_multicall` in
+      # rust-lib/src/glue.rs. The synchronous twin is not a spelling a wasm
+      # image can have: a Worker is a single event loop with no ASYNCIFY
       # (ADR 0004), so a call that blocked for its reply would deadlock the loop
-      # that delivers it. That rewrite is what the `start_get_prices` /
-      # `start_quote_swap` / `start_build_swap` + `take_result` methods are --
-      # the shape an async call has from the outside, on every target.
+      # that delivers it — which is what `start_get_prices` / `start_quote_swap`
+      # / `start_build_swap` + `take_result` are for, and why `get_prices` and
+      # its twins refuse on this target instead of dispatching.
       #
-      # WHAT IS STILL MISSING IS NOT IN THIS REPO. logos-protocol's wasm subset
-      # (cpp/implementations/wasm/wasm_lp_abi.cpp) implements the token/inbound
-      # half of the C ABI and not the outbound one, so an image linking this
-      # crate still fails at `wasm-ld` naming `lp_client_create` /
-      # `lp_client_destroy` / `lp_invoke_async`. Until that lands (#166), the
-      # builder's dependency gate (#165) publishes no `web` output for a module
-      # with dependencies at all, so there is nothing here to build and no
-      # `checks.web-variant` to publish.
+      # Keyed by `systems`, not by `targets`: a check is BUILT and RUN here, and
+      # x86_64-windows is a cross target this machine cannot run.
       #
-      # WHEN #166 LANDS, this block goes and `checks.<system>.web-variant`
-      # arrives with it: a node harness driving `start_get_prices` +
-      # `take_result` against a stub `eth_rpc_module` answering the Multicall3
-      # `eth_call`, modelled on logos-evm-keystore-module/nix/web-variant-test.nix.
-      #
-      # WHAT THE PHONE DOES MEANWHILE, unchanged: uniswap runs as a NATIVE
-      # Bundled Bare module in the app image (the mobile keys above), and the
-      # wallet UI's `web` variant calls it BY NAME over the view door -- the same
-      # path it already takes to eth_rpc_module. No wasm uniswap is involved in a
-      # working Market tab.
+      # A SKIP THAT SAYS SO when the builder publishes no `web` output for this
+      # module — a pin whose logos-protocol has no wasm outbound door, or one
+      # from before the builder could compile a Rust core to wasm32 at all. That
+      # is a pin rollout, not a defect, and an absent check would be a green run
+      # with a silently missing test.
+      checks = nixpkgs.lib.genAttrs systems (system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          modulePkgs = module.packages.${system};
+        in {
+          web-variant =
+            if modulePkgs ? web
+            then import ./nix/web-variant-test.nix { inherit pkgs; webVariant = modulePkgs.web; }
+            else pkgs.runCommand "uniswap-web-variant-tests-skipped" { } ''
+              echo "SKIP: web-variant -- this pin publishes no \`web\` output for"
+              echo "      uniswap_module. A module with dependencies gets one only"
+              echo "      when logos-protocol's wasm subset carries the outbound"
+              echo "      door (hasOutboundDoor). Force the workspace flake, whose"
+              echo "      pins do carry it -- a bare --auto-local on a clean tree"
+              echo "      builds this module's own lock and lands back here:"
+              echo "        ws test logos-evm-uniswap-module --local logos-evm-uniswap-module"
+              mkdir -p $out
+              echo skipped > $out/result
+            '';
+        });
+
+      # WHAT THE PHONE DOES, unchanged by any of the above: uniswap runs as a
+      # NATIVE Bundled Bare module in the app image (the mobile keys above), and
+      # the wallet UI's `web` variant calls it BY NAME over the view door — the
+      # same path it already takes to eth_rpc_module. No wasm uniswap is involved
+      # in a working Market tab.
     };
 }
