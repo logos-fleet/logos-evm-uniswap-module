@@ -77,9 +77,8 @@ impl JobBoard {
         let id = format!("j{}", self.next.fetch_add(1, Ordering::Relaxed));
         let mut slots = self.slots.lock().unwrap();
         while slots.order.len() >= CAPACITY {
-            if let Some(oldest) = slots.order.pop_front() {
-                slots.by_id.remove(&oldest);
-            }
+            let Some(oldest) = slots.order.pop_front() else { break };
+            slots.by_id.remove(&oldest);
         }
         slots.by_id.insert(id.clone(), None);
         slots.order.push_back(id.clone());
@@ -101,15 +100,11 @@ impl JobBoard {
     /// for ever, and the board does not need a second call to clear it.
     pub fn take(&self, id: &str) -> Job {
         let mut slots = self.slots.lock().unwrap();
-        match slots.by_id.get(id) {
-            None => Job::Unknown,
-            Some(None) => Job::Pending,
-            Some(Some(_)) => {
-                let answer = slots.by_id.remove(id).flatten().unwrap_or_default();
-                slots.order.retain(|x| x != id);
-                Job::Ready(answer)
-            }
-        }
+        let Some(slot) = slots.by_id.get_mut(id) else { return Job::Unknown };
+        let Some(answer) = slot.take() else { return Job::Pending };
+        slots.by_id.remove(id);
+        slots.order.retain(|x| x != id);
+        Job::Ready(answer)
     }
 
     /// Slots currently held (in flight + completed-and-uncollected).

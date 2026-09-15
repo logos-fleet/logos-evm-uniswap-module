@@ -67,7 +67,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::config::{ChainUniswap, ConfigStore, STABLE_DECIMALS};
-use crate::jobs::{Job, JobBoard};
+use crate::jobs::{self, Job, JobBoard};
 use crate::pricing::{self, parse_addr as parse_addr_opt};
 use crate::swap;
 
@@ -300,17 +300,54 @@ struct BuildPlan {
     deadline: U256,
 }
 
+/// What a plan tells the transport: which chain to ask, and the one batched
+/// `eth_call` to issue (`None` = nothing to ask). Written once per plan so that
+/// both spellings of a method — waiting and `start_*` — dispatch it identically
+/// and neither has to know where in the plan the Multicall3 address sits.
+trait MulticallPlan {
+    fn chain_id(&self) -> i64;
+    fn request(&self) -> Option<String>;
+}
+
+impl MulticallPlan for PricesPlan {
+    fn chain_id(&self) -> i64 {
+        self.chain_id
+    }
+    fn request(&self) -> Option<String> {
+        multicall_request(&self.multicall3, &self.batch.calls)
+    }
+}
+
+impl MulticallPlan for QuotePlan {
+    fn chain_id(&self) -> i64 {
+        self.chain_id
+    }
+    fn request(&self) -> Option<String> {
+        multicall_request(&self.chain.multicall3, &self.batch.calls)
+    }
+}
+
+/// A build is its quote's call — the build itself is offline calldata over the
+/// same reply, so nothing extra leaves the process.
+impl MulticallPlan for BuildPlan {
+    fn chain_id(&self) -> i64 {
+        self.quote.chain_id()
+    }
+    fn request(&self) -> Option<String> {
+        self.quote.request()
+    }
+}
+
 fn finish_prices(plan: &PricesPlan, results: &[Option<Vec<u8>>]) -> String {
     let eth_prices = pricing::decode_prices(&plan.batch, results);
     let usd_prices = pricing::token_usd_prices(&eth_prices, plan.weth, &plan.stable_addrs);
 
     // Report the user's tokens (+ native ETH) with both prices.
-    let mut out = Vec::new();
-    out.push(json!({
+    let mut out = vec![json!({
         "address": "ETH",
         "eth": 1.0,
         "usd": usd_prices.get(&plan.weth).copied(),
-    }));
+    })];
     for (spelling, addr) in &plan.requested {
         out.push(json!({
             "address": spelling,
@@ -417,17 +454,14 @@ impl UniswapModuleImpl {
         let weth = parse_addr_opt(&chain.weth).ok_or("invalid WETH address in config")?;
         let stable_addrs: Vec<Address> = chain.stablecoins.iter().filter_map(|s| parse_addr_opt(s)).collect();
 
-        // Price the user's tokens plus the stablecoins (USD anchor).
-        let requested: Vec<(String, Address)> = req
-            .tokens
-            .iter()
-            .filter_map(|t| parse_addr_opt(&t.address).map(|a| (t.address.clone(), a)))
-            .collect();
+        // Price the user's tokens plus the stablecoins (USD anchor). One pass, so
+        // a token whose address does not parse is dropped from both lists alike.
+        let mut requested: Vec<(String, Address)> = Vec::new();
         let mut priced: Vec<(Address, u8)> = Vec::new();
         for t in &req.tokens {
-            if let Some(a) = parse_addr_opt(&t.address) {
-                priced.push((a, t.decimals));
-            }
+            let Some(addr) = parse_addr_opt(&t.address) else { continue };
+            requested.push((t.address.clone(), addr));
+            priced.push((addr, t.decimals));
         }
         for s in &stable_addrs {
             if !priced.iter().any(|(a, _)| a == s) {
@@ -482,15 +516,28 @@ impl UniswapModuleImpl {
     }
 }
 
-/// Start `plan`'s call, park `finish(plan, reply)` on the board, and answer the
-/// job id. The one place the three `start_*` methods differ is `finish`.
-fn start_job<P, F>(chain_id: i64, request: Option<String>, plan: P, finish: F) -> String
+/// Issue `plan`'s call, WAIT for the reply, and answer what `finish` makes of
+/// it. The waiting spelling of a method; see this file's header for why waiting
+/// is safe on a native host and impossible on a `web` image.
+fn await_answer<P: MulticallPlan>(plan: P, finish: impl FnOnce(&P, &[Option<Vec<u8>>]) -> String) -> String {
+    match await_multicall(plan.chain_id(), plan.request()) {
+        Ok(results) => finish(&plan, &results),
+        Err(e) => err(e),
+    }
+}
+
+/// Issue `plan`'s call, park `finish(plan, reply)` on the board, and answer the
+/// job id at once. The `start_*` spelling; the one place the three differ is
+/// `finish`.
+fn start_job<P, F>(plan: P, finish: F) -> String
 where
-    P: Send + 'static,
+    P: MulticallPlan + Send + 'static,
     F: FnOnce(&P, &[Option<Vec<u8>>]) -> String + Send + 'static,
 {
     let job_id = JOBS.start();
     let job = job_id.clone();
+    let chain_id = plan.chain_id();
+    let request = plan.request();
     dispatch_multicall(chain_id, request, move |reply| {
         let answer = match reply {
             Ok(results) => finish(&plan, &results),
@@ -526,64 +573,45 @@ impl UniswapModule for UniswapModuleImpl {
     }
 
     fn get_prices(&self, chain_id: i64, tokens_json: String) -> String {
-        let plan = match self.plan_prices(chain_id, &tokens_json) {
-            Ok(p) => p,
-            Err(e) => return err(e),
-        };
-        match await_multicall(plan.chain_id, multicall_request(&plan.multicall3, &plan.batch.calls)) {
-            Ok(results) => finish_prices(&plan, &results),
+        match self.plan_prices(chain_id, &tokens_json) {
+            Ok(plan) => await_answer(plan, finish_prices),
             Err(e) => err(e),
         }
     }
 
     fn quote_swap(&self, chain_id: i64, params_json: String) -> String {
-        let plan = match self.plan_swap_quote(chain_id, &params_json) {
-            Ok(p) => p,
-            Err(e) => return err(e),
-        };
-        match await_multicall(plan.chain_id, multicall_request(&plan.chain.multicall3, &plan.batch.calls)) {
-            Ok(results) => finish_quote_swap(&plan, &results),
+        match self.plan_swap_quote(chain_id, &params_json) {
+            Ok(plan) => await_answer(plan, finish_quote_swap),
             Err(e) => err(e),
         }
     }
 
     fn build_swap(&self, chain_id: i64, params_json: String) -> String {
-        let plan = match self.plan_build(chain_id, &params_json) {
-            Ok(p) => p,
-            Err(e) => return err(e),
-        };
-        let request = multicall_request(&plan.quote.chain.multicall3, &plan.quote.batch.calls);
-        match await_multicall(plan.quote.chain_id, request) {
-            Ok(results) => finish_build_swap(&plan, &results),
+        match self.plan_build(chain_id, &params_json) {
+            Ok(plan) => await_answer(plan, finish_build_swap),
             Err(e) => err(e),
         }
     }
 
     fn start_get_prices(&self, chain_id: i64, tokens_json: String) -> String {
-        let plan = match self.plan_prices(chain_id, &tokens_json) {
-            Ok(p) => p,
-            Err(e) => return err(e),
-        };
-        let request = multicall_request(&plan.multicall3, &plan.batch.calls);
-        start_job(plan.chain_id, request, plan, finish_prices)
+        match self.plan_prices(chain_id, &tokens_json) {
+            Ok(plan) => start_job(plan, finish_prices),
+            Err(e) => err(e),
+        }
     }
 
     fn start_quote_swap(&self, chain_id: i64, params_json: String) -> String {
-        let plan = match self.plan_swap_quote(chain_id, &params_json) {
-            Ok(p) => p,
-            Err(e) => return err(e),
-        };
-        let request = multicall_request(&plan.chain.multicall3, &plan.batch.calls);
-        start_job(plan.chain_id, request, plan, finish_quote_swap)
+        match self.plan_swap_quote(chain_id, &params_json) {
+            Ok(plan) => start_job(plan, finish_quote_swap),
+            Err(e) => err(e),
+        }
     }
 
     fn start_build_swap(&self, chain_id: i64, params_json: String) -> String {
-        let plan = match self.plan_build(chain_id, &params_json) {
-            Ok(p) => p,
-            Err(e) => return err(e),
-        };
-        let request = multicall_request(&plan.quote.chain.multicall3, &plan.quote.batch.calls);
-        start_job(plan.quote.chain_id, request, plan, finish_build_swap)
+        match self.plan_build(chain_id, &params_json) {
+            Ok(plan) => start_job(plan, finish_build_swap),
+            Err(e) => err(e),
+        }
     }
 
     fn take_result(&self, job_id: String) -> String {
@@ -592,7 +620,7 @@ impl UniswapModule for UniswapModuleImpl {
             Job::Pending => json!({ "ok": false, "pending": true, "jobId": job_id }).to_string(),
             Job::Unknown => err(format!(
                 "unknown job '{job_id}': never started, already collected, or evicted after {} newer ones",
-                crate::jobs::CAPACITY
+                jobs::CAPACITY
             )),
         }
     }
