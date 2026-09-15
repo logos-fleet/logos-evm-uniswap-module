@@ -99,7 +99,7 @@
       # / `start_build_swap` + `take_result` are for, and why `get_prices` and
       # its twins refuse on this target instead of dispatching.
       #
-      # forAllSystems, not forAllTargets: a check is BUILT and RUN here, and
+      # Keyed by `systems`, not by `targets`: a check is BUILT and RUN here, and
       # x86_64-windows is a cross target this machine cannot run.
       #
       # A SKIP THAT SAYS SO when the builder publishes no `web` output for this
@@ -119,8 +119,10 @@
               echo "SKIP: web-variant -- this pin publishes no \`web\` output for"
               echo "      uniswap_module. A module with dependencies gets one only"
               echo "      when logos-protocol's wasm subset carries the outbound"
-              echo "      door (hasOutboundDoor). Run through the workspace flake:"
-              echo "        ws test logos-evm-uniswap-module --auto-local"
+              echo "      door (hasOutboundDoor). Force the workspace flake, whose"
+              echo "      pins do carry it -- a bare --auto-local on a clean tree"
+              echo "      builds this module's own lock and lands back here:"
+              echo "        ws test logos-evm-uniswap-module --local logos-evm-uniswap-module"
               mkdir -p $out
               echo skipped > $out/result
             '';

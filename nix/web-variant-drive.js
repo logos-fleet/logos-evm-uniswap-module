@@ -34,9 +34,17 @@ const CHAIN = {
   v2InitCodeHash: '0x96e8ac4277198ff8b6f785478aa9a39f403cb768dd02cbee326c3e7da348845f',
   v2Router: '0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D',
 };
-const USDC = '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48';
-const CHAIN_ID = 31337;
+// Read back off CHAIN rather than restated, so the fixture cannot drift from
+// itself: the token the drive prices IS the chain's stablecoin.
+const USDC = CHAIN.stablecoins[0];
+const CHAIN_ID = CHAIN.chainId;
+
+// `aggregate3((address,bool,bytes)[])` — the one batch selector this module emits.
 const AGGREGATE3 = '0x82ad56cb';
+
+// What the capability handshake below mints, and therefore what every outbound
+// frame that follows it has to carry.
+const GRANTED_TOKEN = 'tok-for-eth-rpc';
 
 // ── what the stub node answers ──────────────────────────────────────────────
 //
@@ -108,7 +116,8 @@ async function spawn() {
     printErr: (s) => console.error('[image] ' + s),
   });
   const deliver = mod.cwrap('logos_wasm_deliver', null, ['string']);
-  let next = 0;
+  let nextId = 0;
+  let answered = 0;
 
   const image = {
     heard,
@@ -116,10 +125,19 @@ async function spawn() {
     send: (type, payload) => deliver(JSON.stringify({ type, payload })),
     // Frames the IMAGE sent, i.e. its outbound calls.
     outbound: () => heard.filter((m) => m.type === CALL),
+    // ...and the ones no `answer*` helper has replied to yet. The drive answers
+    // them strictly in order, so a step inserted below does not renumber the
+    // steps after it.
+    unanswered: () => image.outbound().slice(answered),
+    take: () => {
+      const frame = image.unanswered()[0];
+      if (frame) answered += 1;
+      return frame;
+    },
     // Answers are synchronous on this transport: the image is driven on this
     // thread and the RESULT is already in `heard` when deliver() returns.
     call: (method, args) => {
-      const id = ++next + 1000;
+      const id = ++nextId;
       image.send(CALL, { id, authToken: '', object: 'uniswap_module', method, args });
       const res = heard.find((m) => m.type === RESULT && m.payload.id === id);
       if (!res) fail(method + ' did not answer at all', heard);
@@ -130,6 +148,15 @@ async function spawn() {
       const raw = image.call(method, args);
       try { return JSON.parse(raw); } catch { fail(method + ' answered malformed JSON: ' + raw); }
     },
+    // The interface the image publishes. Matched on TYPE rather than id: a
+    // MethodsResult can only be the answer to the one Methods frame sent here.
+    methods: () => {
+      const id = ++nextId;
+      image.send(METHODS, { id, authToken: '', object: 'uniswap_module' });
+      const res = heard.find((m) => m.type === METHODS_RESULT);
+      if (!res || !res.payload.ok) fail('the image answered no Methods', heard);
+      return res.payload.methods;
+    },
   };
   return image;
 }
@@ -137,8 +164,8 @@ async function spawn() {
 // The handshake the door runs the first time it dials a target it holds no
 // credential for, answered with `grant`. `""` grants nothing, which is the
 // refusal case.
-function answerHandshake(image, index, grant) {
-  const ask = image.outbound()[index];
+function answerHandshake(image, grant) {
+  const ask = image.take();
   if (!ask || ask.payload.object !== 'capability_module'
       || ask.payload.method !== 'requestModule') {
     fail('the image did not ask capability_module for a token', image.heard);
@@ -151,14 +178,14 @@ function answerHandshake(image, index, grant) {
 
 // The one outbound call this module makes, asserted frame by frame, and
 // answered with `replyHex`. Returns nothing: what it is for is the assertions.
-function answerEthCall(image, index, replyHex, token) {
-  const call = image.outbound()[index];
+function answerEthCall(image, replyHex) {
+  const call = image.take();
   if (!call || call.payload.object !== 'eth_rpc_module' || call.payload.method !== 'call') {
     fail('the image did not issue its eth_call: '
          + JSON.stringify(image.outbound().map((m) => m.payload.object + '.' + m.payload.method)),
          image.heard);
   }
-  if (call.payload.authToken !== token) {
+  if (call.payload.authToken !== GRANTED_TOKEN) {
     fail('the outbound frame carries authToken=' + JSON.stringify(call.payload.authToken)
          + ', not the credential capability_module granted');
   }
@@ -177,6 +204,17 @@ function answerEthCall(image, index, replyHex, token) {
   image.send(RESULT, { id: call.payload.id, ok: true, value: rpcResult(replyHex) });
 }
 
+// How many frames the image has sent that nothing has answered. `0` is "the
+// image dispatched nothing"; `1` is "exactly the one call this step expects, and
+// no handshake in front of it".
+function expectUnanswered(image, count, why) {
+  const pending = image.unanswered();
+  if (pending.length !== count) {
+    fail(why + ': ' + JSON.stringify(pending.map((m) => m.payload.object + '.' + m.payload.method)),
+         image.heard);
+  }
+}
+
 const near = (a, b) => typeof a === 'number' && Math.abs(a - b) < b / 1000;
 
 (async () => {
@@ -187,18 +225,16 @@ const near = (a, b) => typeof a === 'number' && Math.abs(a - b) < b / 1000;
   if (!hello || hello.logosWasmHost !== 'uniswap_module') {
     fail('the image did not announce itself: ' + JSON.stringify(hello));
   }
-  a.send(METHODS, { id: 1, authToken: '', object: 'uniswap_module' });
-  const methods = a.heard.find((m) => m.type === METHODS_RESULT);
-  if (!methods || !methods.payload.ok) fail('the image answered no Methods', a.heard);
-  const names = methods.payload.methods.map((m) => m.name).sort();
+  const names = a.methods().map((m) => m.name).sort();
   for (const want of ['build_swap', 'configure', 'get_chains', 'get_prices', 'quote_swap',
                       'start_build_swap', 'start_get_prices', 'start_quote_swap',
                       'take_result']) {
     if (!names.includes(want)) fail('the published interface is missing ' + want + ': ' + names);
   }
 
-  // `on_context_ready` ran: the seeded multi-chain map is there, which is the
-  // module's own state and not something the host could have answered for it.
+  // `on_context_ready` ran: the seeded multi-chain map is there — 8453 is Base,
+  // one of the four defaults — which is the module's own state and not something
+  // the host could have answered for it.
   const chains = a.json('get_chains', []);
   if (!chains.ok || !(chains.chains || []).some((c) => c.chainId === 8453)) {
     fail('the image has no config store -- on_context_ready did not run: '
@@ -224,10 +260,7 @@ const near = (a, b) => typeof a === 'number' && Math.abs(a - b) < b / 1000;
   if (waited.ok !== false || !/start_get_prices/.test(waited.error || '')) {
     fail('the waiting spelling did not refuse on wasm: ' + JSON.stringify(waited));
   }
-  if (a.outbound().length !== 0) {
-    fail('the waiting spelling dispatched a call it can never collect',
-         a.outbound().map((m) => m.payload));
-  }
+  expectUnanswered(a, 0, 'the waiting spelling dispatched a call it can never collect');
   console.log('PASS: get_prices refuses on a `web` image and names the async spelling');
 
   const started = a.json('start_get_prices', [CHAIN_ID, TOKENS]);
@@ -244,19 +277,19 @@ const near = (a, b) => typeof a === 'number' && Math.abs(a - b) < b / 1000;
   // The image holds no credential for its dependency at startup — the core
   // pushes a module its OWN token and its callers', never an outbound one — so
   // the door runs the capability handshake before the target is dialled at all.
-  answerHandshake(a, 0, 'tok-for-eth-rpc');
-  answerEthCall(a, 1, RESERVES_REPLY, 'tok-for-eth-rpc');
+  answerHandshake(a, GRANTED_TOKEN);
+  answerEthCall(a, RESERVES_REPLY);
 
   const priced = a.json('take_result', [started.jobId]);
   if (!priced.ok || priced.chainId !== CHAIN_ID) fail('take_result: ' + JSON.stringify(priced));
   const byAddress = Object.fromEntries((priced.prices || []).map((p) => [p.address, p]));
-  if (!near(byAddress.ETH && byAddress.ETH.usd, 3000)) {
+  if (!near(byAddress.ETH?.usd, 3000)) {
     fail('ETH is not $3000 against the stub reserves: ' + JSON.stringify(priced.prices));
   }
-  if (!near(byAddress[USDC] && byAddress[USDC].usd, 1)) {
+  if (!near(byAddress[USDC]?.usd, 1)) {
     fail('USDC is not $1 against the stub reserves: ' + JSON.stringify(priced.prices));
   }
-  if (!near(byAddress[USDC] && byAddress[USDC].eth, 1 / 3000)) {
+  if (!near(byAddress[USDC]?.eth, 1 / 3000)) {
     fail('USDC/ETH is not 1/3000: ' + JSON.stringify(priced.prices));
   }
   console.log('PASS: a `web` image priced a token from one Multicall3 batch '
@@ -277,11 +310,8 @@ const near = (a, b) => typeof a === 'number' && Math.abs(a - b) < b / 1000;
   const quoting = a.json('start_quote_swap', [CHAIN_ID, JSON.stringify({
     tokenIn: USDC, tokenOut: 'ETH', amountIn: AMOUNT_IN.toString() })]);
   if (!quoting.ok || !quoting.jobId) fail('start_quote_swap: ' + JSON.stringify(quoting));
-  if (a.outbound().length !== 3) {
-    fail('the second target dial re-ran the handshake: '
-         + JSON.stringify(a.outbound().map((m) => m.payload.object)));
-  }
-  answerEthCall(a, 2, QUOTE_REPLY, 'tok-for-eth-rpc');
+  expectUnanswered(a, 1, 'the second target dial re-ran the handshake');
+  answerEthCall(a, QUOTE_REPLY);
 
   const quote = a.json('take_result', [quoting.jobId]);
   if (!quote.ok || quote.version !== 'V2' || quote.amountOut !== AMOUNT_OUT.toString()) {
@@ -299,11 +329,8 @@ const near = (a, b) => typeof a === 'number' && Math.abs(a - b) < b / 1000;
     tokenIn: USDC, tokenOut: 'ETH', amountIn: AMOUNT_IN.toString(),
     recipient: '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266' })]);
   if (!building.ok || !building.jobId) fail('start_build_swap: ' + JSON.stringify(building));
-  answerEthCall(a, 3, QUOTE_REPLY, 'tok-for-eth-rpc');
-  if (a.outbound().length !== 4) {
-    fail('building a swap took more than the quote it is built on: '
-         + JSON.stringify(a.outbound().map((m) => m.payload.object + '.' + m.payload.method)));
-  }
+  answerEthCall(a, QUOTE_REPLY);
+  expectUnanswered(a, 0, 'building a swap took more than the quote it is built on');
 
   const built = a.json('take_result', [building.jobId]);
   if (!built.ok || built.router !== CHAIN.v2Router) {
@@ -339,12 +366,9 @@ const near = (a, b) => typeof a === 'number' && Math.abs(a - b) < b / 1000;
   const b = await spawn();
   if (b.call('configure', [JSON.stringify(CHAIN)]) !== true) fail('configure did not take (b)');
   const refusedJob = b.json('start_get_prices', [CHAIN_ID, TOKENS]);
-  answerHandshake(b, 0, '');
-
-  if (b.outbound().length !== 1) {
-    fail('the target was dialled without a token: '
-         + JSON.stringify(b.outbound().map((m) => m.payload.object)), b.heard);
-  }
+  if (!refusedJob.ok || !refusedJob.jobId) fail('start_get_prices (b): ' + JSON.stringify(refusedJob));
+  answerHandshake(b, '');
+  expectUnanswered(b, 0, 'the target was dialled without a token');
   const refused = b.json('take_result', [refusedJob.jobId]);
   if (refused.ok !== false || !/eth_rpc_module/.test(refused.error || '')) {
     fail('an ungranted call was not reported to the module as a failure naming the '
